@@ -25,7 +25,6 @@ struct {
 	{0, 0}	
 };
 
-
 const int N = 5;
 
 pthread_t ntid[5];
@@ -102,12 +101,13 @@ void *handler(void *arg) {
 	FILE *fd;
 	FILE *file;
 
-	int k = *((int *) arg);
+	int *p = (int *) arg;
+	int k = *p;
 
 	pthread_mutex_lock(&lock[k]);
 
 	pthread_mutex_unlock(&lock[k]);
-	
+
 	fd = fdopen(cd[k], "r");
 	if (fd == NULL) {
 		printf("error open client descriptor as file \n");
@@ -166,6 +166,8 @@ void *handler(void *arg) {
 						printf("send error \n");
 					}
 				}
+
+				free(content_type);
 			}	
 			else {
 				printf("500 Internal Server Error \n");
@@ -174,13 +176,18 @@ void *handler(void *arg) {
 		}
 	}
 	close(cd[k]);
+	free(p);
 	
 	cd[k] = -1;
+
+	puts ("Handler destroyed");
 }
 
 
 void createThread(int k) {
-	int err = pthread_create(&ntid[k], NULL, handler, (void *) &k);
+	int *m = (int *)malloc(sizeof(int));
+	*m = k;
+	int err = pthread_create(&ntid[k], NULL, handler, (void *) m);
 	if (err != 0) {
 		printf("it's impossible to create a thread %s\n", strerror(err));
 	}
@@ -198,7 +205,7 @@ void *serv(void *arg) {
 				if (pthread_mutex_trylock(&lock[i]) != 0) { 
 					puts("Handler found");
 					cd[i] = item->value;
-					pthread_mutex_unlock(&lock[i]); 
+					pthread_mutex_unlock(&lock[i]);
 
 					TAILQ_REMOVE(&qhead, item, entries);
 					free(item);
@@ -217,7 +224,7 @@ void *serv(void *arg) {
 			if (pthread_mutex_trylock(&lock[i]) == 0) {
 				if (cd[i] == -1) {
 					createThread(i);
-					puts("Handler recreated");
+					printf("Handler %d recreated\n", i);
 				}	
 				else pthread_mutex_unlock(&lock[i]);
 			}	
@@ -261,8 +268,7 @@ int main() {
 	saddr.sin_family = AF_INET;
 	saddr.sin_port = htons(8080);
 	saddr.sin_addr.s_addr = INADDR_ANY;
-	res = bind(ld, (struct sockaddr *)&saddr, sizeof(saddr));
-	if (res == -1) {
+	if (bind(ld, (struct sockaddr *)&saddr, sizeof(saddr)) == -1) {
 		printf("bind error \n");
 	}
 	res = listen(ld, backlog);
