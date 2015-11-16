@@ -1,294 +1,183 @@
-#include <stdlib.h>
 #include <stdio.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
-#include <sys/queue.h>
+#define SERVER "webserver/1.0"
+#define PROTOCOL "HTTP/1.0"
+#define RFC1123FMT "%a, %d %b %Y %H:%M:%S GMT"
+#define PORT 80
 
-struct {
-	char *ext;
-	char *conttype;
-} extensions[] = {
-	{".txt", "text/html"},
-	{".htm", "text/html"},
-	{".html", "text/html"},
-	{".jpg", "text/jpeg"},
-	{".jpeg", "text/jpg"},
-	{".png", "image/png"},
-	{".ico", "image/ico"},
-	{".css", "text/css"},
-	{".js", "text/javascript"},
-	{".php", "text/php"},
-	{".xml", "text/xml"},
-	{".pdf", "application/pdf"},
-	{0, 0}	
-};
-
-const int N = 5;
-
-pthread_t ntid[5];
-pthread_t servtid;
-pthread_mutex_t lock[5];
-int cd[5];
-
-struct qnode {
-        int value;
-        TAILQ_ENTRY(qnode) entries;
-};
-
-TAILQ_HEAD(, qnode) qhead;
-
-void headers(int client, int size, int httpcode, char* content_type) {
-	char buf[1024];
-	char strsize[20];
-	sprintf(strsize, "%d", size);
-	if (httpcode == 200) {
-		strcpy(buf, "HTTP/1.0 200 OK\r\n");
-	}
-	else if (httpcode == 404) {
-		strcpy(buf, "HTTP/1.0 404 Not Found\r\n");
-	}
-	else {
-		strcpy(buf, "HTTP/1.0 500 Internal Server Error\r\n");
-	}
-	send(client, buf, strlen(buf), 0);
-	strcpy(buf, "Connection: keep-alive\r\n");
-	send(client, buf, strlen(buf), 0);
-	strcpy(buf, "Content-length: ");
-	send(client, buf, strlen(buf), 0);
-	strcpy(buf, strsize);
-	send(client, buf, strlen(buf), 0);
-	strcpy(buf, "\r\n");
-	send(client, buf, strlen(buf), 0);
-	strcpy(buf, "simple-server");
-	send(client, buf, strlen(buf), 0);
-	if (content_type != NULL) {
-		sprintf(buf, "Content-Type: %s\r\n", content_type);
-		send(client, buf, strlen(buf), 0);
-		strcpy(buf, "\r\n");
-		send(client, buf, strlen(buf), 0); 
-	}
+char *get_mime_type(char *name) {
+  char *ext = strrchr(name, '.');
+  if (!ext) return NULL;
+  if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return "text/html";
+  if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
+  if (strcmp(ext, ".gif") == 0) return "image/gif";
+  if (strcmp(ext, ".png") == 0) return "image/png";
+  if (strcmp(ext, ".css") == 0) return "text/css";
+  if (strcmp(ext, ".au") == 0) return "audio/basic";
+  if (strcmp(ext, ".wav") == 0) return "audio/wav";
+  if (strcmp(ext, ".avi") == 0) return "video/x-msvideo";
+  if (strcmp(ext, ".mpeg") == 0 || strcmp(ext, ".mpg") == 0) return "video/mpeg";
+  if (strcmp(ext, ".mp3") == 0) return "audio/mpeg";
+  return NULL;
 }
 
-void parseFileName(char *line, char **filepath, size_t *len) {
-	char *start = NULL;
-	while ((*line) != '/') line++;
-	start = line + 1;
-	while ((*line) != ' ') line++;
-	(*len) = line - start;
-	*filepath = (char*)malloc(*len + 1);
-	*filepath = strncpy(*filepath, start, *len);
-	(*filepath)[*len] = '\0';
-	printf("%s \n", *filepath);
+void send_headers(FILE *f, int status, char *title, char *extra, char *mime, 
+                  int length, time_t date) {
+  time_t now;
+  char timebuf[128];
+
+  fprintf(f, "%s %d %s\r\n", PROTOCOL, status, title);
+  fprintf(f, "Server: %s\r\n", SERVER);
+  now = time(NULL);
+  strftime(timebuf, sizeof(timebuf), RFC1123FMT, gmtime(&now));
+  fprintf(f, "Date: %s\r\n", timebuf);
+  if (extra) fprintf(f, "%s\r\n", extra);
+  if (mime) fprintf(f, "Content-Type: %s\r\n", mime);
+  if (length >= 0) fprintf(f, "Content-Length: %d\r\n", length);
+  if (date != -1) {
+    strftime(timebuf, sizeof(timebuf), RFC1123FMT, gmtime(&date));
+    fprintf(f, "Last-Modified: %s\r\n", timebuf);
+  }
+  fprintf(f, "Connection: close\r\n");
+  fprintf(f, "\r\n");
 }
 
-char* getFileExt(char *filename) {
-	return strrchr(filename, '.');
+void send_error(FILE *f, int status, char *title, char *extra, char *text) {
+  send_headers(f, status, title, extra, "text/html", -1, -1);
+  fprintf(f, "<HTML><HEAD><TITLE>%d %s</TITLE></HEAD>\r\n", status, title);
+  fprintf(f, "<BODY><H4>%d %s</H4>\r\n", status, title);
+  fprintf(f, "%s\r\n", text);
+  fprintf(f, "</BODY></HTML>\r\n");
 }
 
-void *handler(void *arg) {
-	int filesize = 0;
-	char *line = NULL;
-	size_t len = 0;
+void send_file(FILE *f, char *path, struct stat *statbuf) {
+  char data[4096];
+  int n;
 
-	char buf[1024];
+  FILE *file = fopen(path, "r");
+  if (!file) {
+    send_error(f, 403, "Forbidden", NULL, "Access denied.");
+  } else {
+    int length = S_ISREG(statbuf->st_mode) ? statbuf->st_size : -1;
+    send_headers(f, 200, "OK", NULL, get_mime_type(path), length, statbuf->st_mtime);
 
-	char *filepath = NULL;
-	size_t filepath_len = 0;
-	int empty_str_count = 0;
-
-	FILE *fd;
-	FILE *file;
-
-	int *p = (int *) arg;
-	int k = *p;
-
-	pthread_mutex_lock(&lock[k]);
-
-	pthread_mutex_unlock(&lock[k]);
-
-	fd = fdopen(cd[k], "r");
-	if (fd == NULL) {
-		printf("error open client descriptor as file \n");
-		printf("500 Internal Server Error \n");
-		headers(cd[k], 0, 500, NULL);
-	} else {
-		int res;
-		while ((res = getline(&line, &len, fd)) != -1) {
-			if (strstr(line, "GET")) {
-				parseFileName(line, &filepath, &filepath_len);
-			}
-			if (strcmp(line, "\r\n") == 0) {
-				empty_str_count++;
-			}
-			else {
-				empty_str_count = 0;
-			}
-			if (empty_str_count == 1) {
-				break;
-			}
-			printf("%s", line);
-		}
-
-		printf("open %s \n", filepath);
-
-		file = fopen(filepath, "rb");
-
-		if (file == NULL) {
-			printf("404 File Not Found \n");
-			headers(cd[k], 0, 404, NULL);
-		}
-		else {
-			char *fileext = getFileExt(filepath);
-			char *content_type = 0;
-			int i = 0;
-			while (extensions[i].ext != 0) {
-				if (strcmp(extensions[i].ext, fileext) == 0) {
-					int n = strlen(extensions[i].conttype);
-					content_type = (char*) malloc(n * sizeof(char));
-					strncpy(content_type, extensions[i].conttype, n);
-					break;
-				}
-				i++;
-			}
-			if (content_type != 0) {
-				fseek(file, 0L, SEEK_END);
-				filesize = ftell(file);
-				fseek(file, 0L, SEEK_SET);
-				headers(cd[k], filesize, 200, content_type); 
-
-				size_t nbytes = 0;
-
-				while ((nbytes = fread(buf, 1, 1024, file)) > 0) {
-					res = send(cd[k], buf, nbytes, 0);
-					if (res == -1) {
-						printf("send error \n");
-					}
-				}
-
-				free(content_type);
-			}	
-			else {
-				printf("500 Internal Server Error \n");
-				headers(cd[k], 0, 500, NULL);
-			}
-		}
-	}
-	close(cd[k]);
-	free(p);
-	
-	cd[k] = -1;
-
-	puts ("Handler destroyed");
+    while ((n = fread(data, 1, sizeof(data), file)) > 0) fwrite(data, 1, n, f);
+    fclose(file);
+  }
 }
 
+int process(FILE *f) {
+  char buf[4096];
+  char *method;
+  char *path;
+  char *protocol;
+  struct stat statbuf;
+  char pathbuf[4096];
+  int len;
 
-void createThread(int k) {
-	int *m = (int *)malloc(sizeof(int));
-	*m = k;
-	int err = pthread_create(&ntid[k], NULL, handler, (void *) m);
-	if (err != 0) {
-		printf("it's impossible to create a thread %s\n", strerror(err));
-	}
+  if (!fgets(buf, sizeof(buf), f)) return -1;
+  printf("URL: %s", buf);
+
+  method = strtok(buf, " ");
+  path = strtok(NULL, " ");
+  protocol = strtok(NULL, "\r");
+  if (!method || !path || !protocol) return -1;
+
+  fseek(f, 0, SEEK_CUR);
+
+  if (strcasecmp(method, "GET") != 0) {
+    send_error(f, 501, "Not supported", NULL, "Method is not supported.");
+  } else if (stat(path, &statbuf) < 0) {
+    send_error(f, 404, "Not Found", NULL, "File not found.");
+  } else if (S_ISDIR(statbuf.st_mode)) {
+    len = strlen(path);
+    if (len == 0 || path[len - 1] != '/') {
+      snprintf(pathbuf, sizeof(pathbuf), "Location: %s/", path);
+      send_error(f, 302, "Found", pathbuf, "Directories must end with a slash.");
+    } else {
+      snprintf(pathbuf, sizeof(pathbuf), "%sindex.html", path);
+      if (stat(pathbuf, &statbuf) >= 0) {
+        send_file(f, pathbuf, &statbuf);
+      } else {
+        DIR *dir;
+        struct dirent *de;
+
+        send_headers(f, 200, "OK", NULL, "text/html", -1, statbuf.st_mtime);
+        fprintf(f, "<HTML><HEAD><TITLE>Index of %s</TITLE></HEAD>\r\n<BODY>", path);
+        fprintf(f, "<H4>Index of %s</H4>\r\n<PRE>\n", path);
+        fprintf(f, "Name                             Last Modified              Size\r\n");
+        fprintf(f, "<HR>\r\n");
+        if (len > 1) fprintf(f, "<A HREF=\"..\">..</A>\r\n");
+
+        dir = opendir(path);
+        while ((de = readdir(dir)) != NULL) {
+          char timebuf[32];
+          struct tm *tm;
+
+          strcpy(pathbuf, path);
+          strcat(pathbuf, de->d_name);
+
+          stat(pathbuf, &statbuf);
+          tm = gmtime(&statbuf.st_mtime);
+          strftime(timebuf, sizeof(timebuf), "%d-%b-%Y %H:%M:%S", tm);
+
+          fprintf(f, "<A HREF=\"%s%s\">", de->d_name, S_ISDIR(statbuf.st_mode) ? "/" : "");
+          fprintf(f, "%s%s", de->d_name, S_ISDIR(statbuf.st_mode) ? "/</A>" : "</A> ");
+          if (strlen(de->d_name) < 32) {
+		int de_name = strlen(de->d_name);
+		fprintf(f, "%*s", 32 - de_name, "");
+		}	
+          if (S_ISDIR(statbuf.st_mode)) {
+            fprintf(f, "%s\r\n", timebuf);
+          } else {
+		int statBUFF = statbuf.st_size;
+            fprintf(f, "%s %10d\r\n", timebuf, statBUFF);
+          }
+        }
+        closedir(dir);
+
+        fprintf(f, "</PRE>\r\n<HR>\r\n<ADDRESS>%s</ADDRESS>\r\n</BODY></HTML>\r\n", SERVER);
+      }
+    }
+  } else {
+    send_file(f, path, &statbuf);
+  }
+
+  return 0;
 }
 
-void *serv(void *arg) {
-	int i;
+int main(int argc, char *argv[]) {
+  int sock;
+  struct sockaddr_in sin;
 
-	while (1) {	
-		struct qnode *item = TAILQ_FIRST(&qhead);
-		if (item != NULL) {
-			puts("Trying finding handler");
-			i = 0;
-			while (i < N) {
-				if (pthread_mutex_trylock(&lock[i]) != 0) { 
-					puts("Handler found");
-					cd[i] = item->value;
-					pthread_mutex_unlock(&lock[i]);
+  sock = socket(AF_INET, SOCK_STREAM, 0);
 
-					TAILQ_REMOVE(&qhead, item, entries);
-					free(item);
+  sin.sin_family = AF_INET;
+  sin.sin_addr.s_addr = INADDR_ANY;
+  sin.sin_port = htons(PORT);
+  bind(sock, (struct sockaddr *) &sin, sizeof(sin));
 
-					break;
-				}
-				else {
-					pthread_mutex_unlock(&lock[i]);
-				}
-				i++;
-			}
-		}
+  listen(sock, 5);
+  printf("HTTP server listening on port %d\n", PORT);
 
-		i = 0;
-		while (i < N) {
-			if (pthread_mutex_trylock(&lock[i]) == 0) {
-				if (cd[i] == -1) {
-					createThread(i);
-					printf("Handler %d recreated\n", i);
-				}	
-				else pthread_mutex_unlock(&lock[i]);
-			}	
-			i++;		
-		}
-	}
-}
+  while (1) {
+    int s;
+    FILE *f;
 
-int main() {
-	int ld = 0;
-	int res = 0;
-	int _cd = 0;
-	const int backlog = 10;
-	struct sockaddr_in saddr;
-	struct sockaddr_in caddr;
-	socklen_t size_saddr;
-	socklen_t size_caddr;
+    s = accept(sock, NULL, NULL);
+    if (s < 0) break;
 
-	struct qnode *qitem;
+    f = fdopen(s, "a+");
+    process(f);
+    fclose(f);
+  }
 
-	int i = 0;
-
-	TAILQ_INIT(&qhead);
-
-	while (i < N) {
-		pthread_mutex_init(&lock[i], NULL);
-		pthread_mutex_lock(&lock[i]);
-		createThread(i);
-		i++;
-	}
-
-	int err = pthread_create(&servtid, NULL, serv, NULL);
-	if (err != 0) {
-		printf("it's impossible to create a thread %s\n", strerror(err));
-	}
-
-	ld = socket(AF_INET, SOCK_STREAM, 0);
-	if (ld == -1) {
-		printf("listener create error \n");
-	}
-	saddr.sin_family = AF_INET;
-	saddr.sin_port = htons(8080);
-	saddr.sin_addr.s_addr = INADDR_ANY;
-	if (bind(ld, (struct sockaddr *)&saddr, sizeof(saddr)) == -1) {
-		printf("bind error \n");
-	}
-	res = listen(ld, backlog);
-	if (res == -1) {
-		printf("listen error \n");
-	}
-
-	puts("Start");
-
-	while (1) {
-		_cd = accept(ld, (struct sockaddr *)&caddr, &size_caddr);
-		if (_cd == -1) {
-			printf("accept error \n");
-		}
-		printf("client in %d descriptor. Client addr is %d \n", _cd, caddr.sin_addr.s_addr);
-
-		qitem = malloc(sizeof(*qitem));
-		qitem->value = _cd;
-                TAILQ_INSERT_TAIL(&qhead, qitem, entries);
-
-	}
-	return 0;
+  close(sock);
+  return 0;
 }
